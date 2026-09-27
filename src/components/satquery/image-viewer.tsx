@@ -1,8 +1,14 @@
 import { useEffect, useRef, useState } from "react";
+import { Focus } from "lucide-react";
 import { SAMPLE_SCENES } from "@/lib/samples";
 import type { AnalysisResult, RasterSlot, ViewerMode } from "@/lib/types";
 import { CLASS_META, type LandClass } from "@/lib/types";
-import { paintChangeOverlay, paintCoverOverlay } from "@/lib/image-analysis";
+import {
+  detectionMatchesClass,
+  paintChangeOverlay,
+  paintCoverOverlay,
+  paintHighlightOverlay,
+} from "@/lib/image-analysis";
 import { clamp } from "@/lib/utils";
 
 type Measure = { a: { x: number; y: number } | null; b: { x: number; y: number } | null };
@@ -17,6 +23,7 @@ type Props = {
   showSeg: boolean;
   showChange: boolean;
   classVisibility: Partial<Record<LandClass, boolean>>;
+  highlightClass?: LandClass;
   measuring: boolean;
   measure: Measure;
   onMeasure: (m: Measure) => void;
@@ -35,6 +42,7 @@ export function ImageViewer({
   showSeg,
   showChange,
   classVisibility,
+  highlightClass,
   measuring,
   measure,
   onMeasure,
@@ -81,7 +89,13 @@ export function ImageViewer({
     const ctx = canvas.getContext("2d")!;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    if (showSeg && analysis?.cover) {
+    if (highlightClass && analysis?.cover) {
+      // Tint ONLY the class the question targets.
+      const tmp = document.createElement("canvas");
+      paintHighlightOverlay(tmp, analysis.cover, highlightClass, 0.5);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(tmp, 0, 0, canvas.width, canvas.height);
+    } else if (showSeg && analysis?.cover) {
       const tmp = document.createElement("canvas");
       paintCoverOverlay(tmp, analysis.cover, classVisibility);
       ctx.imageSmoothingEnabled = false;
@@ -95,7 +109,10 @@ export function ImageViewer({
     }
 
     if (showDetections && analysis) {
-      for (const d of analysis.detections) {
+      const dets = highlightClass
+        ? analysis.detections.filter((d) => detectionMatchesClass(d, highlightClass))
+        : analysis.detections;
+      for (const d of dets) {
         const [x, y, w, h] = d.bbox;
         ctx.strokeStyle = d.source === "model" ? "#9bb8b3" : "#c4a574";
         ctx.lineWidth = Math.max(2, canvas.width / 700);
@@ -154,7 +171,7 @@ export function ImageViewer({
       }
       if (captureRef) captureRef.current = cap;
     }
-  }, [analysis, showDetections, showLabels, showSeg, showChange, classVisibility, measure, primary, captureRef]);
+  }, [analysis, showDetections, showLabels, showSeg, showChange, classVisibility, highlightClass, measure, primary, captureRef]);
 
   const clientToNorm = (clientX: number, clientY: number) => {
     const vp = viewportRef.current;
@@ -270,13 +287,35 @@ export function ImageViewer({
           {Math.round(scale * 100)}% · {primary.width}×{primary.height} · GSD {primary.gsdMeters} m
         </div>
       ) : null}
-      {primary && showSeg && analysis?.cover ? (
+      {primary && (showSeg || highlightClass) && analysis?.cover ? (
         <div className="pointer-events-none absolute right-3 top-3 flex flex-col gap-1 rounded-lg border border-border bg-bg/80 p-2 text-[11px]">
+          {highlightClass ? (
+            <div className="mb-1 flex items-center gap-2 font-medium text-fg">
+              <Focus className="size-3 text-accent" />
+              Focus: {CLASS_META[highlightClass].label}
+            </div>
+          ) : null}
           {(Object.keys(CLASS_META) as LandClass[])
             .filter((k) => k !== "other")
             .map((k) => (
-              <div key={k} className="flex items-center gap-2 text-fg">
-                <span className="size-2.5 rounded-sm" style={{ background: CLASS_META[k].hex }} />
+              <div
+                key={k}
+                className={
+                  highlightClass && k !== highlightClass
+                    ? "flex items-center gap-2 text-subtle"
+                    : "flex items-center gap-2 text-fg"
+                }
+              >
+                <span
+                  className="rounded-sm"
+                  style={{
+                    background: CLASS_META[k].hex,
+                    width: highlightClass === k ? 12 : 10,
+                    height: highlightClass === k ? 12 : 10,
+                    outline: highlightClass === k ? `2px solid ${CLASS_META[k].hex}` : "none",
+                    outlineOffset: 1,
+                  }}
+                />
                 {CLASS_META[k].label}
               </div>
             ))}

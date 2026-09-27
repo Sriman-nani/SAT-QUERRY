@@ -20,6 +20,7 @@ import { Separator } from "@/components/ui/separator";
 import { Tooltip, TooltipProvider } from "@/components/ui/tooltip";
 import { analyzeScene } from "@/lib/analyze";
 import {
+  classFromQuestion,
   computeChange,
   computeCover,
   composeLocalAnswer,
@@ -51,6 +52,7 @@ function loadSample(
   setMode: (m: ViewerMode) => void,
   setAnalysis: (a: AnalysisResult | null) => void,
   setMessages: (m: ChatMessage[]) => void,
+  setHighlightClass: (c: LandClass | undefined) => void,
 ) {
   const loaded = slotFromSample(sample);
   setPrimary(loaded.primary);
@@ -58,6 +60,7 @@ function loadSample(
   setMode(loaded.before ? "split" : "primary");
   setAnalysis(null);
   setMessages([]);
+  setHighlightClass(undefined);
 }
 
 export function SatQueryWorkspace() {
@@ -74,6 +77,7 @@ export function SatQueryWorkspace() {
   const [showSeg, setShowSeg] = useState(true);
   const [showChange, setShowChange] = useState(true);
   const [classVisibility, setClassVisibility] = useState<Partial<Record<LandClass, boolean>>>({});
+  const [highlightClass, setHighlightClass] = useState<LandClass | undefined>(undefined);
   const [measuring, setMeasuring] = useState(false);
   const [measure, setMeasure] = useState<{ a: { x: number; y: number } | null; b: { x: number; y: number } | null }>({
     a: null,
@@ -145,6 +149,8 @@ export function SatQueryWorkspace() {
         if (before) change = await computeChange(before.src, primary.src);
         const localDet = localDetections(cover);
         const intent = inferIntent(q, Boolean(before));
+        const focusClass = classFromQuestion(q);
+        setHighlightClass(focusClass);
         const localAnswer = composeLocalAnswer(q, cover, localDet, change);
         const local: AnalysisResult = {
           answer: localAnswer,
@@ -382,6 +388,7 @@ export function SatQueryWorkspace() {
                 showSeg={showSeg}
                 showChange={showChange}
                 classVisibility={classVisibility}
+                highlightClass={highlightClass}
                 measuring={measuring}
                 measure={measure}
                 onMeasure={setMeasure}
@@ -389,7 +396,7 @@ export function SatQueryWorkspace() {
                   fitRef.current = fn;
                 }}
                 onPickSample={(s) =>
-                  loadSample(s, setPrimary, setBefore, setMode, setAnalysis, setMessages)
+                  loadSample(s, setPrimary, setBefore, setMode, setAnalysis, setMessages, setHighlightClass)
                 }
                 captureRef={captureRef}
               />

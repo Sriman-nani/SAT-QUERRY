@@ -367,3 +367,61 @@ export function paintChangeOverlay(canvas: HTMLCanvasElement, change: ChangeResu
   }
   ctx.putImageData(img, 0, 0);
 }
+
+/**
+ * Map a natural-language question to the land-cover class it targets, if any.
+ * Used to tint + box the region the person is asking about (e.g. "water").
+ */
+export function classFromQuestion(question: string): LandClass | undefined {
+  const q = question.toLowerCase();
+  if (/\bwater\b|\bflood|\briver\b|\blake\b|\bsea\b|\bocean\b|\bharbo(?:u)?r\b|\bcoast\b|\bwet\b/.test(q))
+    return "water";
+  if (/\b(?:building|structure|urban|built[- ]?up|roof|road|street|city)\b/.test(q))
+    return "urban";
+  if (/\b(?:veg|tree|forest|grass|plant|green|crop|farm|agricultur)/.test(q))
+    return "vegetation";
+  if (/\bbare\b|\bsoil\b|\bsand\b|\bdirt\b/.test(q)) return "bare";
+  return undefined;
+}
+
+/** Whether a detection's label belongs to the given land-cover class. */
+export function detectionMatchesClass(d: Detection, cls: LandClass): boolean {
+  const l = d.label.toLowerCase();
+  switch (cls) {
+    case "water":
+      return /water|flood|river|lake|sea/.test(l);
+    case "urban":
+      return /build|struct|urban|road/.test(l);
+    case "vegetation":
+      return /veg|tree|forest|grass|crop|plant/.test(l);
+    case "bare":
+      return /bare|soil|sand|dirt/.test(l);
+    default:
+      return false;
+  }
+}
+
+/** Paint a tint over ONLY the target class — the "highlight the matching area" overlay. */
+export function paintHighlightOverlay(
+  canvas: HTMLCanvasElement,
+  cover: CoverMap,
+  classId: LandClass,
+  alpha = 0.5,
+) {
+  const ctx = canvas.getContext("2d")!;
+  canvas.width = cover.width;
+  canvas.height = cover.height;
+  const target = CLASS_ID[classId];
+  const [r, g, b] = CLASS_META[classId].rgb;
+  const img = ctx.createImageData(cover.width, cover.height);
+  const d = img.data;
+  for (let i = 0; i < cover.mask.length; i++) {
+    if (cover.mask[i] !== target) continue;
+    const o = i * 4;
+    d[o] = r;
+    d[o + 1] = g;
+    d[o + 2] = b;
+    d[o + 3] = Math.round(alpha * 255);
+  }
+  ctx.putImageData(img, 0, 0);
+}
