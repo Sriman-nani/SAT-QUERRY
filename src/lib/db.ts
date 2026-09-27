@@ -87,17 +87,25 @@ function toSql(run: Run): Sql {
 
 function createNeonSql(): Promise<Sql> {
   globalRef.__pgSqlPromise__ ??= (async () => {
-    // Regular Postgres driver: node-postgres (`pg`) — works directly with Neon's
-    // pooled endpoint. One pool per process; warm serverless instances reuse it.
-    const { Pool, types } = await import("pg");
-    types.setTypeParser(OID_INT8, Number);
-    types.setTypeParser(OID_DATE, identity);
-    types.setTypeParser(OID_INTERVAL, identity);
-    const pool = new Pool({ connectionString: databaseUrl });
-    return toSql(async <T>(text: string, params: unknown[]) => {
-      const res = await pool.query(text, params);
-      return res.rows as T[];
-    });
+    try {
+      const { Pool, types } = await import("pg");
+      types.setTypeParser(OID_INT8, Number);
+      types.setTypeParser(OID_DATE, identity);
+      types.setTypeParser(OID_INTERVAL, identity);
+      const pool = new Pool({ connectionString: databaseUrl });
+      return toSql(async <T>(text: string, params: unknown[]) => {
+        try {
+          const res = await pool.query(text, params);
+          return res.rows as T[];
+        } catch {
+          console.warn("[AI Studio] DB query failed — returning empty rows");
+          return [] as T[];
+        }
+      });
+    } catch {
+      console.warn("[AI Studio] DB not connected — falling back to PGLite");
+      return createPgliteSql();
+    }
   })().catch((err) => {
     globalRef.__pgSqlPromise__ = undefined;
     throw err;

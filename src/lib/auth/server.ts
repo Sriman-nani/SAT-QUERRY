@@ -99,6 +99,9 @@ const previewAllowedHosts: string[] = [...PREVIEW_ALLOWED_HOSTS];
 // these for the same server — trusting only `localhost` rejects `127.0.0.1` and
 // breaks email/password with "Invalid origin".
 const LOCAL_DEV_ORIGINS: string[] = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "http://[::1]:3000",
   "http://localhost:8080",
   "http://127.0.0.1:8080",
   "http://[::1]:8080",
@@ -110,7 +113,7 @@ const baseURL = explicitBaseURL ?? {
   // `auto` → trust both http:// and https:// expansions of allowedHosts
   // (preview is https; local dev is http).
   protocol: "auto" as const,
-  fallback: "http://localhost:8080",
+  fallback: "http://localhost:3000",
 };
 
 // Origins Better Auth accepts on credentialed POSTs (sign-up/sign-in, etc.).
@@ -141,9 +144,15 @@ const grokUserInfoUrl = `${issuerBase}/api/auth/oauth2/userinfo`;
 // SAME DB as app data, including email/password users. Both use the Better Auth
 // schema from `migrations/auth/0001_auth.sql`, copied into `migrations/` when
 // the app turns sign-in on.
-const database = databaseUrl
-  ? new Pool({ connectionString: databaseUrl })
-  : { dialect: pgliteDialect(() => getPglite()), type: "postgres" as const };
+let database: Pool | { dialect: ReturnType<typeof pgliteDialect>; type: "postgres" };
+try {
+  database = databaseUrl
+    ? new Pool({ connectionString: databaseUrl })
+    : { dialect: pgliteDialect(() => getPglite()), type: "postgres" as const };
+} catch {
+  console.warn("[AI Studio] DB Pool init failed — using PGLite dialect");
+  database = { dialect: pgliteDialect(() => getPglite()), type: "postgres" as const };
+}
 
 /** Session token cookie name — also read by the live-preview popup completion page. */
 export const SESSION_TOKEN_COOKIE = "__Host-grok-auth.session_token";

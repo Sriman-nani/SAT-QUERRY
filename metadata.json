@@ -1,0 +1,5 @@
+{
+  "name": "SatQuery AI",
+  "description": "Ask natural-language questions about satellite imagery with detections, segmentation, statistics, and change maps.",
+  "requestFramePermissions": []
+}
