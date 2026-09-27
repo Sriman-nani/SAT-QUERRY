@@ -1,0 +1,25 @@
+services:
+  web:
+    image: node:22
+    working_dir: /workspace
+    command: sh -c "npm ci --no-audit --no-fund && npm run dev"
+    ports:
+      - "3000:8080"
+    volumes:
+      - ./:/workspace
+      - node_modules:/workspace/node_modules
+    environment:
+      - __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS
+      - CHOKIDAR_USEPOLLING=true
+    env_file:
+      - path: /run/base44/app.env
+        required: false
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "-o", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+
+volumes:
+  node_modules:

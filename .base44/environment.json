@@ -1,0 +1,12 @@
+{
+  "previewPort": 3000,
+  "healthPath": "/",
+  "startCommand": "docker compose -f docker-compose.base44.yml up -d",
+  "secrets": [
+    {
+      "name": "XAI_API_KEY",
+      "description": "Optional xAI API key (console.x.ai → API Keys). Enables Grok vision narratives/refined detections; without it the app falls back to on-image local analysis.",
+      "requiredAtBoot": false
+    }
+  ]
+}
