@@ -27,6 +27,41 @@ export type Detection = {
   confidence: number;
   bbox: BBox;
   source: "local" | "model";
+  classId?: LandClass;
+  color?: string;
+  highlighted?: boolean;
+};
+
+export type ExtractedItem = {
+  id: string;
+  index: number;
+  label: string;
+  confidence: number;
+  bbox: BBox;
+  cropDataUrl: string;
+  dimensionsText: string;
+  areaText: string;
+  centerText: string;
+  color: string;
+  classId?: LandClass;
+};
+
+export type QueryTarget = {
+  targetLabel: string;
+  isSpecificTarget: boolean;
+  highlightClasses: LandClass[];
+  highlightChange: boolean;
+  colorHex: string;
+  rgb: [number, number, number];
+};
+
+export type TintMap = {
+  width: number;
+  height: number;
+  mask: Uint8Array;
+  colorHex: string;
+  rgb: [number, number, number];
+  coveragePct: number;
 };
 
 export type SegmentStat = {
@@ -66,6 +101,11 @@ export type AnalysisResult = {
   statistics: StatRow[];
   change?: ChangeResult;
   cover?: CoverMap;
+  tint?: TintMap;
+  target?: QueryTarget;
+  highlightedTarget?: string;
+  highlightedSnapshotUrl?: string;
+  extractedItems?: ExtractedItem[];
 };
 
 export type CoverMap = {

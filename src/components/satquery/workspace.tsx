@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Crosshair,
   Download,
   Layers,
   Moon,
@@ -20,18 +21,29 @@ import { Separator } from "@/components/ui/separator";
 import { Tooltip, TooltipProvider } from "@/components/ui/tooltip";
 import { analyzeScene } from "@/lib/analyze";
 import {
+  buildQueryTintMap,
   computeChange,
   computeCover,
   composeLocalAnswer,
   coverToSegments,
+  detectForQuery,
+  extractDetectionCrops,
   inferIntent,
-  localDetections,
+  parseQueryTarget,
+  renderHighlightedSnapshot,
   thumbnailDataUrl,
 } from "@/lib/image-analysis";
-import { exportAnnotatedPng, exportCsv, exportGeoJson, exportJsonReport, exportPdf } from "@/lib/export-results";
+import {
+  downloadDataUrl,
+  exportAnnotatedPng,
+  exportCsv,
+  exportGeoJson,
+  exportJsonReport,
+  exportPdf,
+} from "@/lib/export-results";
 import { rasterFromFile } from "@/lib/raster";
 import { PROMPT_GALLERY, SAMPLE_SCENES, slotFromSample } from "@/lib/samples";
-import type { AnalysisResult, ChatMessage, LandClass, RasterSlot, ViewerMode } from "@/lib/types";
+import type { AnalysisResult, BBox, ChatMessage, ExtractedItem, LandClass, RasterSlot, ViewerMode } from "@/lib/types";
 import { CLASS_META, LAND_CLASSES } from "@/lib/types";
 import { cn, formatArea, formatPct, uid } from "@/lib/utils";
 import { ImageViewer } from "./image-viewer";
@@ -51,6 +63,7 @@ function loadSample(
   setMode: (m: ViewerMode) => void,
   setAnalysis: (a: AnalysisResult | null) => void,
   setMessages: (m: ChatMessage[]) => void,
+  setActiveDetectionId: (id: string | null) => void,
 ) {
   const loaded = slotFromSample(sample);
   setPrimary(loaded.primary);
@@ -58,6 +71,7 @@ function loadSample(
   setMode(loaded.before ? "split" : "primary");
   setAnalysis(null);
   setMessages([]);
+  setActiveDetectionId(null);
 }
 
 export function SatQueryWorkspace() {
@@ -69,10 +83,12 @@ export function SatQueryWorkspace() {
   const [busy, setBusy] = useState(false);
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
   const [mode, setMode] = useState<ViewerMode>("primary");
-  const [showDetections, setShowDetections] = useState(true);
-  const [showLabels, setShowLabels] = useState(true);
+  const [showDetections, setShowDetections] = useState(false);
+  const [showLabels, setShowLabels] = useState(false);
   const [showSeg, setShowSeg] = useState(true);
   const [showChange, setShowChange] = useState(true);
+  const [tintOpacity, setTintOpacity] = useState(0.48);
+  const [activeDetectionId, setActiveDetectionId] = useState<string | null>(null);
   const [classVisibility, setClassVisibility] = useState<Partial<Record<LandClass, boolean>>>({});
   const [measuring, setMeasuring] = useState(false);
   const [measure, setMeasure] = useState<{ a: { x: number; y: number } | null; b: { x: number; y: number } | null }>({
@@ -83,6 +99,7 @@ export function SatQueryWorkspace() {
   const [panelOpen, setPanelOpen] = useState(true);
   const [dragOver, setDragOver] = useState(false);
   const fitRef = useRef<() => void>(() => {});
+  const focusBBoxRef = useRef<(bbox: BBox) => void>(() => {});
   const captureRef = useRef<HTMLCanvasElement | null>(null);
   const chatEnd = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -99,6 +116,14 @@ export function SatQueryWorkspace() {
     const px = Math.hypot(dx, dy);
     return px * primary.gsdMeters;
   }, [measure, primary]);
+
+  const handleFocusItem = useCallback((item: ExtractedItem) => {
+    setActiveDetectionId(item.id);
+    setShowSeg(true);
+    setMobileTab("scene");
+    focusBBoxRef.current(item.bbox);
+    toast.message(`Centered on ${item.label}`);
+  }, []);
 
   const ingestFiles = useCallback(async (files: FileList | File[], asBefore = false) => {
     const list = Array.from(files);
@@ -122,6 +147,7 @@ export function SatQueryWorkspace() {
         }
       }
       setAnalysis(null);
+      setActiveDetectionId(null);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Could not read file");
     }
@@ -136,6 +162,7 @@ export function SatQueryWorkspace() {
       const q = question.trim();
       if (!q) return;
       setDraft("");
+      setActiveDetectionId(null);
       const userMsg: ChatMessage = { id: uid("m"), role: "user", text: q, createdAt: Date.now() };
       setMessages((m) => [...m, userMsg]);
       setBusy(true);
@@ -143,28 +170,66 @@ export function SatQueryWorkspace() {
         const cover = await computeCover(primary.src);
         let change;
         if (before) change = await computeChange(before.src, primary.src);
-        const localDet = localDetections(cover);
+        const target = parseQueryTarget(q, Boolean(before));
+        const targetedDet = await detectForQuery(primary.src, cover, q, target, change);
+        const tint = await buildQueryTintMap(primary.src, cover, q, target, targetedDet, change);
         const intent = inferIntent(q, Boolean(before));
-        const localAnswer = composeLocalAnswer(q, cover, localDet, change);
+        const localAnswer = composeLocalAnswer(q, cover, tint, target, change);
+
+        const nextVisibility: Partial<Record<LandClass, boolean>> = {};
+        if (target.isSpecificTarget && target.highlightClasses.length <= 2) {
+          for (const cls of LAND_CLASSES) {
+            nextVisibility[cls] = target.highlightClasses.includes(cls);
+          }
+        } else {
+          for (const cls of LAND_CLASSES) {
+            nextVisibility[cls] = cls !== "other";
+          }
+        }
+        setClassVisibility(nextVisibility);
+
+        const [extractedItems, highlightedSnapshotUrl] = await Promise.all([
+          extractDetectionCrops(primary.src, targetedDet, primary.gsdMeters, tint, 12),
+          renderHighlightedSnapshot(primary.src, cover, tint, target, change),
+        ]);
+
         const local: AnalysisResult = {
           answer: localAnswer,
           intent,
-          detections: intent === "detect" || intent === "describe" ? localDet : localDet.slice(0, 8),
+          target,
+          tint,
+          highlightedTarget: target.targetLabel,
+          highlightedSnapshotUrl,
+          extractedItems,
+          detections: targetedDet,
           segments: coverToSegments(cover),
-          statistics: LAND_CLASSES.map((c) => ({
-            name: CLASS_META[c].label,
-            value: formatPct(cover.percents[c]),
-            hint: formatArea(
-              cover.counts[c] * (primary.width / cover.width) * (primary.height / cover.height),
-              primary.gsdMeters,
-            ),
-          })),
+          statistics: [
+            {
+              name: `Tinted (${target.targetLabel})`,
+              value: formatPct(tint.coveragePct),
+              hint: formatArea(
+                (tint.coveragePct / 100) * primary.width * primary.height,
+                primary.gsdMeters,
+              ),
+            },
+            ...LAND_CLASSES.map((c) => ({
+              name: CLASS_META[c].label,
+              value: formatPct(cover.percents[c]),
+              hint: formatArea(
+                cover.counts[c] * (primary.width / cover.width) * (primary.height / cover.height),
+                primary.gsdMeters,
+              ),
+            })),
+          ],
           change,
           cover,
         };
 
         const assistantId = uid("m");
         setAnalysis(local);
+        // Just cover the area with tinted color — keep boxes off!
+        setShowDetections(false);
+        setShowLabels(false);
         setShowSeg(true);
         setShowChange(Boolean(local.change));
         setMessages((m) => [
@@ -177,41 +242,69 @@ export function SatQueryWorkspace() {
         void (async () => {
           try {
             const images: { name: string; dataUrl: string; role: "primary" | "before" }[] = [
-              { name: primary.name, dataUrl: await thumbnailDataUrl(primary.src, 512, 0.62), role: "primary" },
+              { name: primary.name, dataUrl: await thumbnailDataUrl(primary.src, 512, 0.68), role: "primary" },
             ];
             if (before) {
               images.unshift({
                 name: before.name,
-                dataUrl: await thumbnailDataUrl(before.src, 512, 0.62),
+                dataUrl: await thumbnailDataUrl(before.src, 512, 0.68),
                 role: "before",
               });
             }
             const history = [...messages, userMsg].map((m) => ({ role: m.role, text: m.text }));
-            const grok = await analyzeScene({
+            const vlm = await analyzeScene({
               data: {
                 question: q,
                 images,
                 history,
                 localStats: {
                   percents: cover.percents,
-                  detectionCount: localDet.length,
+                  detectionCount: targetedDet.length,
                   changePercent: change?.percent,
                   changeSummary: change?.summary,
+                  targetLabel: target.targetLabel,
                 },
               },
             });
-            if (!grok.ok || !grok.analysis.answer) return;
+            if (!vlm.ok || !vlm.analysis.answer) return;
+
+            const finalDetections =
+              vlm.analysis.detections.length > 0
+                ? vlm.analysis.detections.map((d) => ({
+                    ...d,
+                    color: d.color || target.colorHex,
+                    highlighted: true,
+                  }))
+                : local.detections;
+
+            const vlmTint =
+              vlm.analysis.detections.length > 0
+                ? await buildQueryTintMap(primary.src, cover, q, target, finalDetections, change)
+                : local.tint;
+
+            const [vlmExtractedItems, vlmSnapshotUrl] =
+              vlm.analysis.detections.length > 0
+                ? await Promise.all([
+                    extractDetectionCrops(primary.src, finalDetections, primary.gsdMeters, vlmTint, 12),
+                    renderHighlightedSnapshot(primary.src, cover, vlmTint, target, change),
+                  ])
+                : [local.extractedItems, local.highlightedSnapshotUrl];
+
             const merged: AnalysisResult = {
               ...local,
-              answer: grok.analysis.answer,
-              sceneSummary: grok.analysis.sceneSummary,
-              intent: grok.analysis.intent,
-              detections: grok.analysis.detections.length > 0 ? grok.analysis.detections : local.detections,
-              statistics: grok.analysis.statistics.length ? grok.analysis.statistics : local.statistics,
-              change: grok.analysis.change
+              answer: vlm.analysis.answer,
+              sceneSummary: vlm.analysis.sceneSummary,
+              highlightedTarget: vlm.analysis.highlightedTarget || local.highlightedTarget,
+              intent: vlm.analysis.intent,
+              tint: vlmTint,
+              detections: finalDetections,
+              extractedItems: vlmExtractedItems,
+              highlightedSnapshotUrl: vlmSnapshotUrl,
+              statistics: vlm.analysis.statistics.length ? vlm.analysis.statistics : local.statistics,
+              change: vlm.analysis.change
                 ? {
                     ...local.change,
-                    ...grok.analysis.change,
+                    ...vlm.analysis.change,
                     mask: local.change?.mask,
                     width: local.change?.width,
                     height: local.change?.height,
@@ -219,9 +312,11 @@ export function SatQueryWorkspace() {
                 : local.change,
             };
             setAnalysis(merged);
-            setMessages((m) => m.map((msg) => (msg.id === assistantId ? { ...msg, text: merged.answer, analysis: merged } : msg)));
+            setMessages((m) =>
+              m.map((msg) => (msg.id === assistantId ? { ...msg, text: merged.answer, analysis: merged } : msg)),
+            );
           } catch {
-            /* keep local answer */
+            /* keep local answer & tinted area */
           }
         })();
       } catch (err) {
@@ -251,13 +346,17 @@ export function SatQueryWorkspace() {
         }
         return;
       }
-      if (e.key === "0") fitRef.current();
+      if (e.key === "0") {
+        setActiveDetectionId(null);
+        fitRef.current();
+      }
       if (e.key === "m" || e.key === "M") setMeasuring((v) => !v);
       if (e.key === "d" || e.key === "D") setShowDetections((v) => !v);
       if (e.key === "s" || e.key === "S") setShowSeg((v) => !v);
       if (e.key === "Escape") {
         setMeasuring(false);
         setMeasure({ a: null, b: null });
+        setActiveDetectionId(null);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -290,7 +389,9 @@ export function SatQueryWorkspace() {
             </span>
             <div className="leading-tight">
               <div className="text-sm font-semibold tracking-tight">SatQuery AI</div>
-              <div className="hidden text-[11px] text-muted-foreground sm:block">Ask the imagery</div>
+              <div className="hidden text-[11px] text-muted-foreground sm:block">
+                Ask anything — tinted area coverage
+              </div>
             </div>
           </div>
           <div className="ml-auto flex items-center gap-1">
@@ -300,8 +401,16 @@ export function SatQueryWorkspace() {
                 <span className="hidden sm:inline">Upload</span>
               </Button>
             </Tooltip>
-            <Tooltip content="Fit to view">
-              <Button variant="ghost" size="icon-sm" onClick={() => fitRef.current()} aria-label="Fit">
+            <Tooltip content="Reset zoom & fit (0)">
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => {
+                  setActiveDetectionId(null);
+                  fitRef.current();
+                }}
+                aria-label="Fit"
+              >
                 <Focus />
               </Button>
             </Tooltip>
@@ -351,24 +460,32 @@ export function SatQueryWorkspace() {
               ))}
               <span className="mx-1 h-4 w-px bg-border" />
               <label className="flex h-8 items-center gap-1.5 px-2 text-xs text-muted-foreground">
-                <input type="checkbox" checked={showDetections} onChange={(e) => setShowDetections(e.target.checked)} />
-                Boxes
-              </label>
-              <label className="flex h-8 items-center gap-1.5 px-2 text-xs text-muted-foreground">
                 <input type="checkbox" checked={showSeg} onChange={(e) => setShowSeg(e.target.checked)} />
-                Cover
+                Tint area
               </label>
-              <label className="flex h-8 items-center gap-1.5 px-2 text-xs text-muted-foreground">
-                <input type="checkbox" checked={showChange} onChange={(e) => setShowChange(e.target.checked)} />
-                Change
-              </label>
-              <label className="flex h-8 items-center gap-1.5 px-2 text-xs text-muted-foreground">
-                <input type="checkbox" checked={showLabels} onChange={(e) => setShowLabels(e.target.checked)} />
-                Labels
-              </label>
+              {showSeg ? (
+                <label className="flex h-8 items-center gap-1.5 px-2 text-xs text-muted-foreground">
+                  <span>Opacity</span>
+                  <input
+                    type="range"
+                    min={0.15}
+                    max={0.8}
+                    step={0.05}
+                    value={tintOpacity}
+                    onChange={(e) => setTintOpacity(Number(e.target.value))}
+                    className="w-16 accent-accent"
+                  />
+                </label>
+              ) : null}
+              {before ? (
+                <label className="flex h-8 items-center gap-1.5 px-2 text-xs text-muted-foreground">
+                  <input type="checkbox" checked={showChange} onChange={(e) => setShowChange(e.target.checked)} />
+                  Change
+                </label>
+              ) : null}
               <span className="ml-auto hidden items-center gap-1 px-2 text-xs text-muted-foreground sm:flex">
                 <Layers className="size-3.5" />
-                overlays
+                tinted overlay
               </span>
             </div>
             <div className="relative min-h-0 flex-1">
@@ -381,6 +498,9 @@ export function SatQueryWorkspace() {
                 showLabels={showLabels}
                 showSeg={showSeg}
                 showChange={showChange}
+                tintOpacity={tintOpacity}
+                activeDetectionId={activeDetectionId}
+                onSelectDetection={setActiveDetectionId}
                 classVisibility={classVisibility}
                 measuring={measuring}
                 measure={measure}
@@ -388,8 +508,11 @@ export function SatQueryWorkspace() {
                 onFitRequest={(fn) => {
                   fitRef.current = fn;
                 }}
+                onFocusBBoxRequest={(fn) => {
+                  focusBBoxRef.current = fn;
+                }}
                 onPickSample={(s) =>
-                  loadSample(s, setPrimary, setBefore, setMode, setAnalysis, setMessages)
+                  loadSample(s, setPrimary, setBefore, setMode, setAnalysis, setMessages, setActiveDetectionId)
                 }
                 captureRef={captureRef}
               />
@@ -408,7 +531,7 @@ export function SatQueryWorkspace() {
 
           <aside
             className={cn(
-              "flex w-full shrink-0 flex-col border-l border-border bg-surface lg:w-[400px]",
+              "flex w-full shrink-0 flex-col border-l border-border bg-surface lg:w-[420px]",
               mobileTab === "scene" ? "hidden lg:flex" : "flex",
               !panelOpen && "hidden",
             )}
@@ -419,7 +542,8 @@ export function SatQueryWorkspace() {
                   <div>
                     <h1 className="text-lg font-semibold tracking-tight">Query the planet</h1>
                     <p className="mt-1 text-sm text-muted-foreground">
-                      Load a scene, ask in plain language, and get detections, land cover, statistics, and change maps.
+                      Load a scene and ask about anything — water, vegetation, buildings, roads, landing zones, or ships.
+                      SatQuery covers the matching area with a tinted color and gives you the result.
                     </p>
                   </div>
                   <button
@@ -441,24 +565,160 @@ export function SatQueryWorkspace() {
                     <div className="mt-2 space-y-3">
                       {messages.length === 0 ? (
                         <p className="text-sm text-muted-foreground">
-                          Try a prompt below, or type your own question about this scene.
+                          Ask about anything in this scene — e.g. &ldquo;water&rdquo;, &ldquo;buildings&rdquo;,
+                          &ldquo;trees&rdquo;, or &ldquo;landing sites&rdquo;. The matching area will be covered with a
+                          tinted color and delivered here.
                         </p>
                       ) : null}
                       {messages.map((m) => (
                         <div
                           key={m.id}
                           className={cn(
-                            "rounded-lg px-3 py-2 text-sm leading-relaxed",
-                            m.role === "user" ? "bg-secondary" : "bg-bg border border-border",
+                            "rounded-xl px-3 py-2.5 text-sm leading-relaxed",
+                            m.role === "user" ? "bg-secondary" : "border border-border bg-bg",
                           )}
                         >
-                          {m.text}
+                          <div>{m.text}</div>
+
+                          {/* Direct Tinted Area Delivery inside Assistant Message */}
+                          {m.role === "assistant" && m.analysis ? (
+                            <div className="mt-3 space-y-2.5 border-t border-border/70 pt-2.5">
+                              <div className="flex flex-wrap items-center justify-between gap-1.5">
+                                <span className="inline-flex items-center gap-2 text-xs font-semibold text-fg">
+                                  <span
+                                    className="size-3 rounded-sm"
+                                    style={{
+                                      background:
+                                        m.analysis.tint?.colorHex || m.analysis.target?.colorHex || "#38bdf8",
+                                    }}
+                                  />
+                                  Tinted: {m.analysis.highlightedTarget || "Scene area"}
+                                </span>
+                                {m.analysis.tint ? (
+                                  <Badge className="text-[10px]">
+                                    {m.analysis.tint.coveragePct.toFixed(1)}% area
+                                  </Badge>
+                                ) : null}
+                              </div>
+
+                              {/* Tinted Scene Snapshot + Download */}
+                              {m.analysis.highlightedSnapshotUrl ? (
+                                <div className="overflow-hidden rounded-lg border border-border bg-surface">
+                                  <div className="relative">
+                                    <img
+                                      src={m.analysis.highlightedSnapshotUrl}
+                                      alt={`Tinted ${m.analysis.highlightedTarget ?? "scene"}`}
+                                      className="max-h-48 w-full object-cover"
+                                    />
+                                    <div className="absolute bottom-2 right-2 flex items-center gap-1.5">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setAnalysis(m.analysis!);
+                                          setActiveDetectionId(null);
+                                          setShowSeg(true);
+                                          setMobileTab("scene");
+                                          fitRef.current();
+                                        }}
+                                        className="inline-flex items-center gap-1 rounded-md bg-bg/90 px-2 py-1 text-[11px] font-medium text-fg shadow backdrop-blur-sm hover:bg-bg"
+                                      >
+                                        <Focus className="size-3" />
+                                        View on map
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          downloadDataUrl(
+                                            m.analysis!.highlightedSnapshotUrl!,
+                                            `tinted-${(m.analysis!.highlightedTarget || "scene")
+                                              .toLowerCase()
+                                              .replace(/[^a-z0-9]+/g, "-")}.jpg`,
+                                          )
+                                        }
+                                        className="inline-flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-[11px] font-medium text-primary-foreground shadow hover:opacity-90"
+                                      >
+                                        <Download className="size-3" />
+                                        Get tinted image
+                                      </button>
+                                    </div>
+                                  </div>
+                                </div>
+                              ) : null}
+
+                              {/* Extracted Tinted Region Cards */}
+                              {m.analysis.extractedItems && m.analysis.extractedItems.length > 0 ? (
+                                <div>
+                                  <div className="mb-1.5 flex items-center justify-between text-[11px] text-muted-foreground">
+                                    <span>Tinted areas (click to focus on map)</span>
+                                    <span>Top {Math.min(4, m.analysis.extractedItems.length)}</span>
+                                  </div>
+                                  <div className="grid grid-cols-2 gap-2">
+                                    {m.analysis.extractedItems.slice(0, 4).map((item) => {
+                                      const isSelected = activeDetectionId === item.id;
+                                      return (
+                                        <div
+                                          key={item.id}
+                                          className={cn(
+                                            "group flex flex-col overflow-hidden rounded-lg border bg-surface text-left transition-colors",
+                                            isSelected
+                                              ? "border-accent ring-1 ring-accent"
+                                              : "border-border hover:border-accent/60",
+                                          )}
+                                        >
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              setAnalysis(m.analysis!);
+                                              handleFocusItem(item);
+                                            }}
+                                            className="relative aspect-16/10 w-full overflow-hidden bg-sidebar text-left"
+                                          >
+                                            <img
+                                              src={item.cropDataUrl}
+                                              alt={item.label}
+                                              className="h-full w-full object-cover transition-transform group-hover:scale-105"
+                                            />
+                                            <span className="absolute bottom-1.5 right-1.5 inline-flex items-center gap-0.5 rounded bg-bg/85 px-1.5 py-0.5 text-[10px] text-accent">
+                                              <Crosshair className="size-2.5" />
+                                              Focus
+                                            </span>
+                                          </button>
+                                          <div className="flex items-center justify-between gap-1 px-2 py-1.5">
+                                            <div className="min-w-0">
+                                              <div className="truncate text-[11px] font-medium text-fg">{item.label}</div>
+                                              <div className="truncate font-mono text-[10px] text-muted-foreground">
+                                                {item.areaText}
+                                              </div>
+                                            </div>
+                                            <button
+                                              type="button"
+                                              onClick={() =>
+                                                downloadDataUrl(
+                                                  item.cropDataUrl,
+                                                  `${item.label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.png`,
+                                                )
+                                              }
+                                              className="shrink-0 rounded p-1 text-muted-foreground hover:bg-secondary hover:text-fg"
+                                              title="Download this tinted area"
+                                              aria-label={`Download ${item.label}`}
+                                            >
+                                              <Download className="size-3.5" />
+                                            </button>
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              ) : null}
+                            </div>
+                          ) : null}
                         </div>
                       ))}
                       {busy ? (
                         <div className="flex items-center gap-2 text-sm text-muted-foreground">
                           <LoaderCircle className="size-4 animate-spin" />
-                          Reading the scene…
+                          Tinting matching area…
                         </div>
                       ) : null}
                       <div ref={chatEnd} />
@@ -486,7 +746,11 @@ export function SatQueryWorkspace() {
                       <div>
                         <div className="mb-2 flex items-center justify-between">
                           <div className="text-xs font-medium uppercase tracking-wide text-subtle">Land cover</div>
-                          <Badge>{analysis.detections.length} objects</Badge>
+                          {analysis.tint ? (
+                            <Badge>{analysis.tint.coveragePct.toFixed(1)}% tinted</Badge>
+                          ) : (
+                            <Badge>{analysis.detections.length} areas</Badge>
+                          )}
                         </div>
                         <div className="h-40">
                           <ResponsiveContainer width="100%" height="100%">
@@ -521,26 +785,6 @@ export function SatQueryWorkspace() {
                         {analysis.change ? (
                           <p className="mt-3 text-xs text-muted-foreground">{analysis.change.summary}</p>
                         ) : null}
-                      </div>
-                      <div className="flex flex-wrap gap-1">
-                        {(Object.keys(CLASS_META) as LandClass[])
-                          .filter((k) => k !== "other")
-                          .map((k) => (
-                            <button
-                              key={k}
-                              className={cn(
-                                "rounded-full border px-2 py-1 text-[11px]",
-                                classVisibility[k] === false ? "border-border text-subtle" : "border-border text-fg",
-                              )}
-                              onClick={() => setClassVisibility((v) => ({ ...v, [k]: v[k] === false }))}
-                            >
-                              <span
-                                className="mr-1.5 inline-block size-2 rounded-sm"
-                                style={{ background: CLASS_META[k].hex }}
-                              />
-                              {CLASS_META[k].label}
-                            </button>
-                          ))}
                       </div>
                       <div className="flex flex-wrap gap-2">
                         <Button size="sm" variant="secondary" onClick={() => analysis && primary && exportCsv(analysis)}>
@@ -609,7 +853,11 @@ export function SatQueryWorkspace() {
                     void runQuery(draft);
                   }
                 }}
-                placeholder={primary ? "VLM: ask what you see in this scene…" : "Load a scene, then ask a VLM question"}
+                placeholder={
+                  primary
+                    ? "Ask about anything (e.g. water, buildings, trees, roads) to tint that area…"
+                    : "Load a scene, then ask about anything to tint & get it"
+                }
                 disabled={!primary || busy}
                 rows={3}
                 className="w-full resize-none rounded-lg border border-border bg-bg px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/70 disabled:opacity-50"
@@ -617,10 +865,10 @@ export function SatQueryWorkspace() {
               <div className="mt-2 flex items-center justify-between gap-2">
                 <span className="inline-flex items-center gap-1.5 text-[11px] text-subtle">
                   <Badge className="border-accent/40 bg-secondary text-fg">VLM</Badge>
-                  VLM · Enter to send
+                  Tint Area &amp; Deliver · Enter to send
                 </span>
                 <Button type="submit" size="sm" disabled={!primary || busy || !draft.trim()}>
-                  <Send /> Ask
+                  <Send /> Tint &amp; Get
                 </Button>
               </div>
             </form>

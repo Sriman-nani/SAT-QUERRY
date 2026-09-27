@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
+import { Download, X } from "lucide-react";
 import { SAMPLE_SCENES } from "@/lib/samples";
-import type { AnalysisResult, RasterSlot, ViewerMode } from "@/lib/types";
+import type { AnalysisResult, BBox, RasterSlot, ViewerMode } from "@/lib/types";
 import { CLASS_META, type LandClass } from "@/lib/types";
-import { paintChangeOverlay, paintCoverOverlay } from "@/lib/image-analysis";
+import { paintChangeOverlay, paintCoverOverlay, paintTintOverlay } from "@/lib/image-analysis";
+import { downloadDataUrl } from "@/lib/export-results";
 import { clamp } from "@/lib/utils";
 
 type Measure = { a: { x: number; y: number } | null; b: { x: number; y: number } | null };
@@ -16,11 +18,15 @@ type Props = {
   showLabels: boolean;
   showSeg: boolean;
   showChange: boolean;
+  tintOpacity?: number;
+  activeDetectionId?: string | null;
+  onSelectDetection?: (id: string | null) => void;
   classVisibility: Partial<Record<LandClass, boolean>>;
   measuring: boolean;
   measure: Measure;
   onMeasure: (m: Measure) => void;
   onFitRequest?: (fn: () => void) => void;
+  onFocusBBoxRequest?: (fn: (bbox: BBox) => void) => void;
   onPickSample?: (sample: (typeof SAMPLE_SCENES)[number]) => void;
   captureRef?: React.MutableRefObject<HTMLCanvasElement | null>;
 };
@@ -34,11 +40,15 @@ export function ImageViewer({
   showLabels,
   showSeg,
   showChange,
+  tintOpacity = 0.48,
+  activeDetectionId,
+  onSelectDetection,
   classVisibility,
   measuring,
   measure,
   onMeasure,
   onFitRequest,
+  onFocusBBoxRequest,
   onPickSample,
   captureRef,
 }: Props) {
@@ -49,7 +59,7 @@ export function ImageViewer({
   const [scale, setScale] = useState(1);
   const [tx, setTx] = useState(0);
   const [ty, setTy] = useState(0);
-  const drag = useRef<{ x: number; y: number; tx: number; ty: number } | null>(null);
+  const drag = useRef<{ x: number; y: number; tx: number; ty: number; moved: boolean } | null>(null);
 
   const fit = () => {
     const vp = viewportRef.current;
@@ -64,14 +74,43 @@ export function ImageViewer({
     setTy((vp.clientHeight - primary.height * s) / 2);
   };
 
+  const focusBBox = (bbox: BBox) => {
+    const vp = viewportRef.current;
+    if (!vp || !primary) return;
+    const [bx, by, bw, bh] = bbox;
+    const targetW = Math.max(bw * primary.width, 120);
+    const targetH = Math.max(bh * primary.height, 120);
+    const desiredScale = clamp(
+      Math.min((vp.clientWidth * 0.48) / targetW, (vp.clientHeight * 0.48) / targetH),
+      0.35,
+      4.5,
+    );
+    const cx = (bx + bw / 2) * primary.width;
+    const cy = (by + bh / 2) * primary.height;
+    setScale(desiredScale);
+    setTx(vp.clientWidth / 2 - cx * desiredScale);
+    setTy(vp.clientHeight / 2 - cy * desiredScale);
+  };
+
   useEffect(() => {
     fit();
     onFitRequest?.(fit);
+    onFocusBBoxRequest?.(focusBBox);
     const ro = new ResizeObserver(() => fit());
     if (viewportRef.current) ro.observe(viewportRef.current);
     return () => ro.disconnect();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [primary?.id, mode]);
+
+  useEffect(() => {
+    onFocusBBoxRequest?.(focusBBox);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [primary?.id]);
+
+  const activeDet =
+    activeDetectionId && analysis?.detections
+      ? analysis.detections.find((d) => d.id === activeDetectionId)
+      : undefined;
 
   useEffect(() => {
     const canvas = overlayRef.current;
@@ -81,46 +120,58 @@ export function ImageViewer({
     const ctx = canvas.getContext("2d")!;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    if (showSeg && analysis?.cover) {
-      const tmp = document.createElement("canvas");
-      paintCoverOverlay(tmp, analysis.cover, classVisibility);
-      ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(tmp, 0, 0, canvas.width, canvas.height);
+    const imgEl = worldRef.current?.querySelector("img.primary-raster") as HTMLImageElement | null;
+
+    // Primary Tinted Color Overlay covering the queried area
+    if (showSeg && analysis) {
+      if (analysis.tint && analysis.target?.isSpecificTarget) {
+        const tmp = document.createElement("canvas");
+        paintTintOverlay(tmp, analysis.tint, tintOpacity, activeDet?.bbox ?? null);
+        ctx.imageSmoothingEnabled = true;
+        ctx.drawImage(tmp, 0, 0, canvas.width, canvas.height);
+      } else if (analysis.cover) {
+        const tmp = document.createElement("canvas");
+        paintCoverOverlay(tmp, analysis.cover, classVisibility, tintOpacity);
+        ctx.imageSmoothingEnabled = true;
+        ctx.drawImage(tmp, 0, 0, canvas.width, canvas.height);
+      }
     }
 
-    if (showChange && analysis?.change?.mask) {
+    if (showChange && analysis?.change?.mask && !analysis.target?.highlightChange) {
       const tmp = document.createElement("canvas");
       paintChangeOverlay(tmp, analysis.change);
       ctx.drawImage(tmp, 0, 0, canvas.width, canvas.height);
     }
 
+    // Optional bounding boxes (off by default — only drawn if user explicitly enables Boxes)
     if (showDetections && analysis) {
-      for (const d of analysis.detections) {
+      analysis.detections.forEach((d, idx) => {
         const [x, y, w, h] = d.bbox;
-        ctx.strokeStyle = d.source === "model" ? "#9bb8b3" : "#c4a574";
-        ctx.lineWidth = Math.max(2, canvas.width / 700);
-        ctx.strokeRect(x * canvas.width, y * canvas.height, w * canvas.width, h * canvas.height);
-        if (showLabels) {
-          const label = `${d.label} ${Math.round(d.confidence * 100)}%`;
-          ctx.font = `${Math.max(12, canvas.width / 90)}px IBM Plex Sans, sans-serif`;
-          const tw = ctx.measureText(label).width + 10;
-          const th = Math.max(16, canvas.width / 70);
-          ctx.fillStyle = "rgba(7,9,11,0.82)";
-          ctx.fillRect(x * canvas.width, y * canvas.height - th, tw, th);
-          ctx.fillStyle = "#e8ebe9";
-          ctx.fillText(label, x * canvas.width + 5, y * canvas.height - 5);
-        }
-      }
-    }
+        const rx = x * canvas.width;
+        const ry = y * canvas.height;
+        const rw = w * canvas.width;
+        const rh = h * canvas.height;
+        const baseColor = d.color || analysis.target?.colorHex || "#38bdf8";
 
-    if (analysis?.change?.regions && showChange) {
-      ctx.setLineDash([8, 6]);
-      ctx.strokeStyle = "#d07058";
-      for (const r of analysis.change.regions) {
-        const [x, y, w, h] = r.bbox;
-        ctx.strokeRect(x * canvas.width, y * canvas.height, w * canvas.width, h * canvas.height);
-      }
-      ctx.setLineDash([]);
+        ctx.fillStyle = `${baseColor}38`;
+        ctx.fillRect(rx, ry, rw, rh);
+        ctx.strokeStyle = baseColor;
+        ctx.lineWidth = Math.max(2, canvas.width / 600);
+        ctx.strokeRect(rx, ry, rw, rh);
+
+        if (showLabels) {
+          const label = `#${idx + 1} ${d.label}`;
+          const fontSize = Math.max(11, Math.round(canvas.width / 92));
+          ctx.font = `600 ${fontSize}px IBM Plex Sans, sans-serif`;
+          const tw = ctx.measureText(label).width + 10;
+          const th = Math.max(16, Math.round(canvas.width / 68));
+          const labelY = Math.max(0, ry - th);
+          ctx.fillStyle = "rgba(7, 9, 11, 0.82)";
+          ctx.fillRect(rx, labelY, tw, th);
+          ctx.fillStyle = "#f8fafc";
+          ctx.fillText(label, rx + 5, labelY + th - 4);
+        }
+      });
     }
 
     if (measure.a) {
@@ -147,14 +198,25 @@ export function ImageViewer({
       cap.width = primary.width;
       cap.height = primary.height;
       const cctx = cap.getContext("2d")!;
-      const img = worldRef.current?.querySelector("img.primary-raster") as HTMLImageElement | null;
-      if (img?.complete) {
-        cctx.drawImage(img, 0, 0, cap.width, cap.height);
+      if (imgEl?.complete) {
+        cctx.drawImage(imgEl, 0, 0, cap.width, cap.height);
         cctx.drawImage(canvas, 0, 0);
       }
       if (captureRef) captureRef.current = cap;
     }
-  }, [analysis, showDetections, showLabels, showSeg, showChange, classVisibility, measure, primary, captureRef]);
+  }, [
+    analysis,
+    showDetections,
+    showLabels,
+    showSeg,
+    showChange,
+    tintOpacity,
+    activeDet,
+    classVisibility,
+    measure,
+    primary,
+    captureRef,
+  ]);
 
   const clientToNorm = (clientX: number, clientY: number) => {
     const vp = viewportRef.current;
@@ -164,6 +226,11 @@ export function ImageViewer({
     const y = (clientY - rect.top - ty) / scale / primary.height;
     return { x: clamp(x, 0, 1), y: clamp(y, 0, 1) };
   };
+
+  const activeExtractedItem =
+    activeDetectionId && analysis?.extractedItems
+      ? analysis.extractedItems.find((item) => item.id === activeDetectionId)
+      : undefined;
 
   return (
     <div
@@ -194,15 +261,27 @@ export function ImageViewer({
         }
         if (!primary) return;
         (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
-        drag.current = { x: e.clientX, y: e.clientY, tx, ty };
+        drag.current = { x: e.clientX, y: e.clientY, tx, ty, moved: false };
       }}
       onPointerMove={(e) => {
         if (!drag.current) return;
-        setTx(drag.current.tx + (e.clientX - drag.current.x));
-        setTy(drag.current.ty + (e.clientY - drag.current.y));
+        const dx = e.clientX - drag.current.x;
+        const dy = e.clientY - drag.current.y;
+        if (Math.hypot(dx, dy) > 4) drag.current.moved = true;
+        setTx(drag.current.tx + dx);
+        setTy(drag.current.ty + dy);
       }}
-      onPointerUp={() => {
+      onPointerUp={(e) => {
+        const wasClick = drag.current && !drag.current.moved;
         drag.current = null;
+        if (wasClick && primary && analysis?.detections.length && onSelectDetection && !measuring) {
+          const p = clientToNorm(e.clientX, e.clientY);
+          const hit = analysis.detections.find((d) => {
+            const [bx, by, bw, bh] = d.bbox;
+            return p.x >= bx && p.x <= bx + bw && p.y >= by && p.y <= by + bh;
+          });
+          onSelectDetection(hit ? (hit.id === activeDetectionId ? null : hit.id) : null);
+        }
       }}
       role="application"
       aria-label="Satellite image viewer"
@@ -236,8 +315,25 @@ export function ImageViewer({
         >
           {mode === "split" && before ? (
             <div className="flex" style={{ width: primary.width * 2, height: primary.height }}>
-              <img src={before.src} alt={before.name} width={primary.width} height={primary.height} className="block select-none" draggable={false} />
-              <img src={primary.src} alt={primary.name} width={primary.width} height={primary.height} className="primary-raster block select-none" draggable={false} />
+              <img
+                src={before.src}
+                alt={before.name}
+                width={primary.width}
+                height={primary.height}
+                className="block select-none"
+                draggable={false}
+              />
+              <div className="relative" style={{ width: primary.width, height: primary.height }}>
+                <img
+                  src={primary.src}
+                  alt={primary.name}
+                  width={primary.width}
+                  height={primary.height}
+                  className="primary-raster block h-full w-full select-none"
+                  draggable={false}
+                />
+                <canvas ref={overlayRef} className="pointer-events-none absolute inset-0 h-full w-full" />
+              </div>
             </div>
           ) : (
             <div className="relative" style={{ width: primary.width, height: primary.height }}>
@@ -264,16 +360,77 @@ export function ImageViewer({
           )}
         </div>
       )}
+
       {primary ? <canvas ref={captureCanvasRef} className="hidden" /> : null}
+
+      {/* Top-left Tinted Area Legend Badge when a query is active */}
+      {primary && showSeg && analysis?.highlightedTarget ? (
+        <div className="pointer-events-none absolute left-3 top-3 flex items-center gap-2 rounded-lg border border-border bg-bg/90 px-3 py-1.5 text-xs shadow-lg backdrop-blur-sm">
+          <span
+            className="size-3 rounded-sm"
+            style={{ background: analysis.tint?.colorHex || analysis.target?.colorHex || "#38bdf8" }}
+          />
+          <span className="font-medium text-fg">{analysis.highlightedTarget}</span>
+          {analysis.tint ? (
+            <span className="rounded bg-secondary px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
+              {analysis.tint.coveragePct.toFixed(1)}% of scene
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+
+      {/* Floating Inspector Card when a tinted region is selected */}
+      {primary && activeExtractedItem ? (
+        <div className="absolute bottom-12 left-3 z-10 flex w-72 items-center gap-3 rounded-xl border border-accent/60 bg-surface/95 p-2.5 shadow-xl backdrop-blur-md">
+          <img
+            src={activeExtractedItem.cropDataUrl}
+            alt={activeExtractedItem.label}
+            className="size-16 shrink-0 rounded-lg border border-border object-cover"
+          />
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center justify-between gap-1">
+              <div className="truncate text-xs font-semibold text-fg">{activeExtractedItem.label}</div>
+              <button
+                type="button"
+                onClick={() => onSelectDetection?.(null)}
+                className="rounded p-0.5 text-muted-foreground hover:bg-secondary hover:text-fg"
+                aria-label="Close selected item"
+              >
+                <X className="size-3.5" />
+              </button>
+            </div>
+            <div className="mt-0.5 font-mono text-[11px] text-muted-foreground">
+              {activeExtractedItem.dimensionsText} · {activeExtractedItem.areaText}
+            </div>
+            <div className="mt-1.5 flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() =>
+                  downloadDataUrl(
+                    activeExtractedItem.cropDataUrl,
+                    `${activeExtractedItem.label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.png`,
+                  )
+                }
+                className="inline-flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-[11px] font-medium text-primary-foreground hover:opacity-90"
+              >
+                <Download className="size-3" />
+                Get tinted area
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {primary ? (
         <div className="pointer-events-none absolute bottom-3 left-3 rounded-md border border-border bg-bg/80 px-2 py-1 font-mono text-xs text-muted-foreground">
           {Math.round(scale * 100)}% · {primary.width}×{primary.height} · GSD {primary.gsdMeters} m
         </div>
       ) : null}
-      {primary && showSeg && analysis?.cover ? (
+
+      {primary && showSeg && analysis?.cover && !analysis.target?.isSpecificTarget ? (
         <div className="pointer-events-none absolute right-3 top-3 flex flex-col gap-1 rounded-lg border border-border bg-bg/80 p-2 text-[11px]">
           {(Object.keys(CLASS_META) as LandClass[])
-            .filter((k) => k !== "other")
+            .filter((k) => k !== "other" && classVisibility[k] !== false)
             .map((k) => (
               <div key={k} className="flex items-center gap-2 text-fg">
                 <span className="size-2.5 rounded-sm" style={{ background: CLASS_META[k].hex }} />
