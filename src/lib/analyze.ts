@@ -13,6 +13,8 @@ type AnalyzeInput = {
   history: { role: "user" | "assistant"; text: string }[];
 };
 
+let grokSkipUntil = 0;
+
 function extractJson(text: string): Partial<AnalysisResult> | null {
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
@@ -24,13 +26,7 @@ function extractJson(text: string): Partial<AnalysisResult> | null {
   }
 }
 
-export const analyzeScene = createServerFn({ method: "POST" })
-  .validator((input: AnalyzeInput) => input)
-  .handler(async ({ data }): Promise<{ ok: true; analysis: AnalysisResult } | { ok: false; error: string }> => {
-    const apiKey = process.env.XAI_API_KEY;
-    if (!apiKey) return { ok: false, error: "AI is not available in this environment" };
-
-    const system = `You are SatQuery AI, a vision-language model (VLM) for Earth observation.
+const SYSTEM = `You are SatQuery AI, a vision-language model (VLM) for Earth observation.
 Every turn is a VLM query: the attached satellite image(s) are primary evidence; text is the question.
 Reply with ONLY compact JSON:
 {
@@ -47,20 +43,30 @@ Ground every claim in what is visible. Use client land-cover stats as a prior; d
 Prefer fewer, high-quality detections (max 24). If two images, first is BEFORE and second is AFTER.
 No markdown.`;
 
-    const content: unknown[] = [];
-    for (const img of data.images) {
-      content.push({
-        type: "image_url",
-        image_url: { url: img.dataUrl, detail: "high" },
-      });
+export const analyzeScene = createServerFn({ method: "POST" })
+  .validator((input: AnalyzeInput) => input)
+  .handler(async ({ data }): Promise<{ ok: true; analysis: AnalysisResult } | { ok: false; error: string }> => {
+    const apiKey = process.env.XAI_API_KEY;
+    if (!apiKey) return { ok: false, error: "AI is not available in this environment" };
+    if (Date.now() < grokSkipUntil) {
+      return { ok: false, error: "Grok is temporarily unavailable; using on-image analysis." };
     }
-    const historyBlock = data.history
-      .slice(-6)
-      .map((m) => `${m.role}: ${m.text}`)
-      .join("\n");
-    content.push({
-      type: "text",
-      text: `[VLM query]
+
+    try {
+      const content: unknown[] = [];
+      for (const img of data.images) {
+        content.push({
+          type: "image_url",
+          image_url: { url: img.dataUrl, detail: "high" },
+        });
+      }
+      const historyBlock = data.history
+        .slice(-6)
+        .map((m) => `${m.role}: ${m.text}`)
+        .join("\n");
+      content.push({
+        type: "text",
+        text: `[VLM query]
 Analyze the attached satellite image(s) with a vision-language model. Ground the answer in pixels, then in the numeric priors.
 
 Image names: ${data.images.map((i) => `${i.role}=${i.name}`).join(", ")}
@@ -70,67 +76,86 @@ ${data.localStats.changePercent != null ? `Pixel change: ${data.localStats.chang
 Prior turns:
 ${historyBlock || "(none)"}
 User question: ${data.question}`,
-    });
+      });
 
-    const res = await fetch("https://api.x.ai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: "grok-4.5",
-        temperature: 0.2,
-        max_tokens: 1800,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content },
-        ],
-      }),
-    });
+      const res = await fetch("https://api.x.ai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: "grok-4.5",
+          temperature: 0.2,
+          max_tokens: 1800,
+          messages: [
+            { role: "system", content: SYSTEM },
+            { role: "user", content },
+          ],
+        }),
+      });
 
-    if (!res.ok) {
-      return { ok: false, error: `xAI API error ${res.status}` };
-    }
-    const body = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
-    };
-    const text = body.choices?.[0]?.message?.content ?? "";
-    const parsed = extractJson(text);
-    if (!parsed?.answer) {
+      if (!res.ok) {
+        let detail = `xAI API error ${res.status}`;
+        try {
+          const errJson = (await res.json()) as { error?: string; code?: string };
+          if (errJson.error) detail = errJson.error;
+          if (res.status === 403 || String(errJson.code).includes("spending")) {
+            grokSkipUntil = Date.now() + 15 * 60 * 1000;
+          }
+        } catch {
+          if (res.status === 403) grokSkipUntil = Date.now() + 15 * 60 * 1000;
+        }
+        return { ok: false, error: detail };
+      }
+
+      const body = (await res.json()) as {
+        choices?: { message?: { content?: string } }[];
+      };
+      const text = body.choices?.[0]?.message?.content ?? "";
+      const parsed = extractJson(text);
+      if (!parsed?.answer) {
+        return {
+          ok: true,
+          analysis: {
+            answer: text.slice(0, 1200) || "The model returned an empty response.",
+            intent: "describe",
+            detections: [],
+            segments: [],
+            statistics: [],
+          },
+        };
+      }
+
+      const detections: Detection[] = Array.isArray(parsed.detections)
+        ? parsed.detections
+            .filter((d) => Array.isArray(d.bbox) && d.bbox.length === 4)
+            .slice(0, 24)
+            .map((d, i) => ({
+              id: d.id || `m${i}`,
+              label: String(d.label || "object"),
+              confidence: Number(d.confidence ?? 0.7),
+              bbox: d.bbox,
+              source: "model" as const,
+            }))
+        : [];
+
       return {
         ok: true,
         analysis: {
-          answer: text.slice(0, 1200) || "The model returned an empty response.",
-          intent: "describe",
-          detections: [],
-          segments: [],
-          statistics: [],
+          answer: String(parsed.answer),
+          sceneSummary: parsed.sceneSummary ? String(parsed.sceneSummary) : undefined,
+          intent: parsed.intent ?? "describe",
+          detections,
+          segments: Array.isArray(parsed.segments) ? parsed.segments.slice(0, 8) : [],
+          statistics: Array.isArray(parsed.statistics) ? parsed.statistics.slice(0, 12) : [],
+          change: parsed.change,
         },
       };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : "Vision request failed",
+      };
     }
-
-    const detections: Detection[] = Array.isArray(parsed.detections)
-      ? parsed.detections
-          .filter((d) => Array.isArray(d.bbox) && d.bbox.length === 4)
-          .slice(0, 24)
-          .map((d, i) => ({
-            id: d.id || `m${i}`,
-            label: String(d.label || "object"),
-            confidence: Number(d.confidence ?? 0.7),
-            bbox: d.bbox,
-            source: "model" as const,
-          }))
-      : [];
-
-    const analysis: AnalysisResult = {
-      answer: String(parsed.answer),
-      sceneSummary: parsed.sceneSummary ? String(parsed.sceneSummary) : undefined,
-      intent: parsed.intent ?? "describe",
-      detections,
-      segments: Array.isArray(parsed.segments) ? parsed.segments.slice(0, 8) : [],
-      statistics: Array.isArray(parsed.statistics) ? parsed.statistics.slice(0, 12) : [],
-      change: parsed.change,
-    };
-    return { ok: true, analysis };
   });

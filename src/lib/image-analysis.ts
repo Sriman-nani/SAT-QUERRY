@@ -1,6 +1,7 @@
 import {
   CLASS_META,
   LAND_CLASSES,
+  type AnalysisResult,
   type CoverMap,
   type Detection,
   type LandClass,
@@ -257,6 +258,63 @@ export function coverToSegments(cover: CoverMap) {
     color: CLASS_META[c].hex,
   }));
 }
+
+export function inferIntent(question: string, hasPair: boolean): AnalysisResult["intent"] {
+  const q = question.toLowerCase();
+  if (hasPair && /change|deforest|new construction|before|after|clear/.test(q)) return "change";
+  if (/detect|how many|count|building|ship|vehicle|road/.test(q)) return "detect";
+  if (/segment|mask|highlight|show me water|show me veg/.test(q)) return "segment";
+  if (/percent|coverage|area|statistic|how much/.test(q)) return "stats";
+  if (/flood/.test(q)) return "segment";
+  return "describe";
+}
+
+export function composeLocalAnswer(
+  question: string,
+  cover: CoverMap,
+  detections: Detection[],
+  change?: ChangeResult,
+): string {
+  const ranked = [...LAND_CLASSES]
+    .map((c) => ({ c, p: cover.percents[c] }))
+    .sort((a, b) => b.p - a.p);
+  const coverLine = ranked
+    .filter((x) => x.p >= 1.5)
+    .map((x) => `${CLASS_META[x.c].label} ${x.p.toFixed(1)}%`)
+    .join(", ");
+  const top = ranked[0];
+  const water = cover.percents.water;
+  const veg = cover.percents.vegetation;
+  const urban = cover.percents.urban;
+  const q = question.toLowerCase();
+  const nBuild = detections.filter((d) => /build|struct/i.test(d.label)).length;
+  const nWater = detections.filter((d) => /water/i.test(d.label)).length;
+
+  if (/flood/.test(q)) {
+    if (water >= 18) {
+      return `Yes — this scene reads as inundated. Water / turbid flood occupies about ${water.toFixed(1)}% of the frame, with remaining ground split between vegetation (${veg.toFixed(1)}%) and built-up or bare surfaces. Isolated bright patches inside the water are consistent with rooftops or high ground. Land cover: ${coverLine}.`;
+    }
+    return `Flood signal is limited. Water covers about ${water.toFixed(1)}% of the image, which looks more like a river, harbor, or wet field than a widespread inundation. Land cover: ${coverLine}.`;
+  }
+  if (/change|deforest|new construction/.test(q) && change) {
+    return `${change.summary} Dominant cover now: ${coverLine}. ${nBuild ? `${nBuild} built-up patches are outlined.` : "No large new structure clusters stood out."}`;
+  }
+  if (/detect|how many|count|building/.test(q)) {
+    return `I outlined ${detections.length} object regions (${nBuild} built-up, ${nWater} water). Built-up surfaces are ${urban.toFixed(1)}% of the scene. These are spectral blobs, not a trained detector — use the boxes as a first pass. Land cover: ${coverLine}.`;
+  }
+  if (/segment|water body|vegetation|cover/.test(q) || /percent|area|statistic/.test(q)) {
+    return `Land-cover mix for this scene: ${coverLine}. ${
+      top ? `${CLASS_META[top.c].label} is the largest class.` : ""
+    } Overlays are on — toggle classes in the legend.`;
+  }
+  if (/landing/.test(q)) {
+    return `Open ground is the bare-soil + low-vegetation mix (${(cover.percents.bare + Math.max(0, veg - urban)).toFixed(1)}% combined heuristic). Avoid the ${urban.toFixed(1)}% built-up and ${water.toFixed(1)}% water. Check the cover overlay for the largest contiguous pale patches.`;
+  }
+  return `This looks like a ${top ? CLASS_META[top.c].label.toLowerCase() + "-led" : "mixed"} scene. Land cover: ${coverLine}. ${
+    detections.length ? `${detections.length} candidate objects are available if you ask to detect them.` : ""
+  } Ask to segment, count buildings, or run change detection for a tighter readout.`;
+}
+
 
 export async function thumbnailDataUrl(src: string, maxEdge = 768, quality = 0.72) {
   const img = await loadHtmlImage(src);

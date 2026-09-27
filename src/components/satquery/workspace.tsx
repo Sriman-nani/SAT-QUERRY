@@ -22,7 +22,9 @@ import { analyzeScene } from "@/lib/analyze";
 import {
   computeChange,
   computeCover,
+  composeLocalAnswer,
   coverToSegments,
+  inferIntent,
   localDetections,
   thumbnailDataUrl,
 } from "@/lib/image-analysis";
@@ -142,10 +144,12 @@ export function SatQueryWorkspace() {
         let change;
         if (before) change = await computeChange(before.src, primary.src);
         const localDet = localDetections(cover);
+        const intent = inferIntent(q, Boolean(before));
+        const localAnswer = composeLocalAnswer(q, cover, localDet, change);
         const local: AnalysisResult = {
-          answer: "",
-          intent: before && /change|deforest|new construction/i.test(q) ? "change" : "describe",
-          detections: localDet,
+          answer: localAnswer,
+          intent,
+          detections: intent === "detect" || intent === "describe" ? localDet : localDet.slice(0, 8),
           segments: coverToSegments(cover),
           statistics: LAND_CLASSES.map((c) => ({
             name: CLASS_META[c].label,
@@ -159,71 +163,67 @@ export function SatQueryWorkspace() {
           cover,
         };
 
-        const images: { name: string; dataUrl: string; role: "primary" | "before" }[] = [
-          { name: primary.name, dataUrl: await thumbnailDataUrl(primary.src), role: "primary" },
-        ];
-        if (before) {
-          images.unshift({
-            name: before.name,
-            dataUrl: await thumbnailDataUrl(before.src),
-            role: "before",
-          });
-        }
-
-        const history = [...messages, userMsg].map((m) => ({ role: m.role, text: m.text }));
-        const res = await analyzeScene({
-          data: {
-            question: q,
-            images,
-            history,
-            localStats: {
-              percents: cover.percents,
-              detectionCount: localDet.length,
-              changePercent: change?.percent,
-              changeSummary: change?.summary,
-            },
-          },
-        });
-
-        let merged: AnalysisResult = local;
-        if (res.ok) {
-          merged = {
-            ...local,
-            answer: res.analysis.answer,
-            sceneSummary: res.analysis.sceneSummary,
-            intent: res.analysis.intent,
-            detections:
-              res.analysis.detections.length > 0
-                ? res.analysis.detections
-                : res.analysis.intent === "detect"
-                  ? local.detections
-                  : [],
-            statistics: res.analysis.statistics.length ? res.analysis.statistics : local.statistics,
-            change: res.analysis.change
-              ? {
-                  ...local.change,
-                  ...res.analysis.change,
-                  mask: local.change?.mask,
-                  width: local.change?.width,
-                  height: local.change?.height,
-                }
-              : local.change,
-          };
-        } else {
-          merged = {
-            ...local,
-            answer: `${local.change?.summary ?? "Local land-cover analysis complete."} AI commentary is unavailable (${res.error}).`,
-          };
-        }
-
-        setAnalysis(merged);
+        const assistantId = uid("m");
+        setAnalysis(local);
         setShowSeg(true);
-        setShowChange(Boolean(merged.change));
+        setShowChange(Boolean(local.change));
         setMessages((m) => [
           ...m,
-          { id: uid("m"), role: "assistant", text: merged.answer, analysis: merged, createdAt: Date.now() },
+          { id: assistantId, role: "assistant", text: local.answer, analysis: local, createdAt: Date.now() },
         ]);
         setMobileTab("ask");
+        setBusy(false);
+
+        void (async () => {
+          try {
+            const images: { name: string; dataUrl: string; role: "primary" | "before" }[] = [
+              { name: primary.name, dataUrl: await thumbnailDataUrl(primary.src, 512, 0.62), role: "primary" },
+            ];
+            if (before) {
+              images.unshift({
+                name: before.name,
+                dataUrl: await thumbnailDataUrl(before.src, 512, 0.62),
+                role: "before",
+              });
+            }
+            const history = [...messages, userMsg].map((m) => ({ role: m.role, text: m.text }));
+            const grok = await analyzeScene({
+              data: {
+                question: q,
+                images,
+                history,
+                localStats: {
+                  percents: cover.percents,
+                  detectionCount: localDet.length,
+                  changePercent: change?.percent,
+                  changeSummary: change?.summary,
+                },
+              },
+            });
+            if (!grok.ok || !grok.analysis.answer) return;
+            const merged: AnalysisResult = {
+              ...local,
+              answer: grok.analysis.answer,
+              sceneSummary: grok.analysis.sceneSummary,
+              intent: grok.analysis.intent,
+              detections: grok.analysis.detections.length > 0 ? grok.analysis.detections : local.detections,
+              statistics: grok.analysis.statistics.length ? grok.analysis.statistics : local.statistics,
+              change: grok.analysis.change
+                ? {
+                    ...local.change,
+                    ...grok.analysis.change,
+                    mask: local.change?.mask,
+                    width: local.change?.width,
+                    height: local.change?.height,
+                  }
+                : local.change,
+            };
+            setAnalysis(merged);
+            setMessages((m) => m.map((msg) => (msg.id === assistantId ? { ...msg, text: merged.answer, analysis: merged } : msg)));
+          } catch {
+            /* keep local answer */
+          }
+        })();
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "Analysis failed");
         setMessages((m) => [
@@ -603,6 +603,12 @@ export function SatQueryWorkspace() {
                 id="ask"
                 value={draft}
                 onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void runQuery(draft);
+                  }
+                }}
                 placeholder={primary ? "VLM: ask what you see in this scene…" : "Load a scene, then ask a VLM question"}
                 disabled={!primary || busy}
                 rows={3}
@@ -611,7 +617,7 @@ export function SatQueryWorkspace() {
               <div className="mt-2 flex items-center justify-between gap-2">
                 <span className="inline-flex items-center gap-1.5 text-[11px] text-subtle">
                   <Badge className="border-accent/40 bg-secondary text-fg">VLM</Badge>
-                  Vision query · Ctrl+Enter
+                  VLM · Enter to send
                 </span>
                 <Button type="submit" size="sm" disabled={!primary || busy || !draft.trim()}>
                   <Send /> Ask
