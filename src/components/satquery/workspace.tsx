@@ -603,13 +603,16 @@ export function SatQueryWorkspace() {
                 id="ask"
                 value={draft}
                 onChange={(e) => setDraft(e.target.value)}
-                placeholder={primary ? "Ask about this scene…" : "Load a scene, then ask a question"}
+                placeholder={primary ? "VLM: ask what you see in this scene…" : "Load a scene, then ask a VLM question"}
                 disabled={!primary || busy}
                 rows={3}
                 className="w-full resize-none rounded-lg border border-border bg-bg px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/70 disabled:opacity-50"
               />
-              <div className="mt-2 flex items-center justify-between">
-                <span className="text-[11px] text-subtle">Ctrl+Enter to send</span>
+              <div className="mt-2 flex items-center justify-between gap-2">
+                <span className="inline-flex items-center gap-1.5 text-[11px] text-subtle">
+                  <Badge className="border-accent/40 bg-secondary text-fg">VLM</Badge>
+                  Vision query · Ctrl+Enter
+                </span>
                 <Button type="submit" size="sm" disabled={!primary || busy || !draft.trim()}>
                   <Send /> Ask
                 </Button>

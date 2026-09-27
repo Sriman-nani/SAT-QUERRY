@@ -30,7 +30,9 @@ export const analyzeScene = createServerFn({ method: "POST" })
     const apiKey = process.env.XAI_API_KEY;
     if (!apiKey) return { ok: false, error: "AI is not available in this environment" };
 
-    const system = `You are SatQuery AI, an Earth-observation analyst. Reply with ONLY compact JSON:
+    const system = `You are SatQuery AI, a vision-language model (VLM) for Earth observation.
+Every turn is a VLM query: the attached satellite image(s) are primary evidence; text is the question.
+Reply with ONLY compact JSON:
 {
   "answer": "plain language answer (2-6 sentences)",
   "sceneSummary": "one line",
@@ -41,7 +43,7 @@ export const analyzeScene = createServerFn({ method: "POST" })
   "change": {"percent":12.4,"summary":"...","regions":[{"label":"clearing","bbox":[0.2,0.3,0.1,0.1]}]}
 }
 bbox is normalized [x,y,width,height] from the top-left of the PRIMARY image.
-Use the client-computed land cover as a prior; do not invent wildly different percentages.
+Ground every claim in what is visible. Use client land-cover stats as a prior; do not invent wildly different percentages.
 Prefer fewer, high-quality detections (max 24). If two images, first is BEFORE and second is AFTER.
 No markdown.`;
 
@@ -58,7 +60,10 @@ No markdown.`;
       .join("\n");
     content.push({
       type: "text",
-      text: `Image names: ${data.images.map((i) => `${i.role}=${i.name}`).join(", ")}
+      text: `[VLM query]
+Analyze the attached satellite image(s) with a vision-language model. Ground the answer in pixels, then in the numeric priors.
+
+Image names: ${data.images.map((i) => `${i.role}=${i.name}`).join(", ")}
 Client land cover %: ${JSON.stringify(data.localStats.percents)}
 Local object proposals: ${data.localStats.detectionCount}
 ${data.localStats.changePercent != null ? `Pixel change: ${data.localStats.changePercent.toFixed(1)}%. ${data.localStats.changeSummary ?? ""}` : "Single image (no before pair)."}
